@@ -1,15 +1,52 @@
-- name: Install Switch Dependencies
-        shell: bash
-        run: |
-          # Configure custom XferCommand with browser User-Agent to bypass Cloudflare 403 blocking
-          echo 'XferCommand = /usr/bin/curl -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -L -C - -f -o %o %u' >> /opt/devkitpro/pacman/etc/pacman.conf
+name: Build Switch NRO
 
-          # Synchronize databases and install libraries
-          dkp-pacman -Sy --noconfirm \
-            switch-curl \
-            switch-mbedtls \
-            switch-zlib \
-            switch-sdl2 \
-            switch-sdl2_image \
-            switch-sdl2_ttf \
-            switch-tools
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Configure pacman agent
+        run: |
+          echo 'XferCommand = /usr/bin/curl -A "Mozilla/5.0" -L -C - -f -o %o %u' >> /opt/devkitpro/pacman/etc/pacman.conf
+
+      - name: Install Switch libraries
+        run: |
+          dkp-pacman -S --noconfirm --needed \
+            switch-sdl2 switch-sdl2_image switch-sdl2_ttf \
+            switch-curl switch-mbedtls switch-zlib switch-tools
+
+      - name: Configure CMake
+        run: |
+          mkdir build && cd build
+          cmake .. \
+            -DUSE_LIBNX=ON \
+            -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE='-Oz -flto -DNDEBUG' \
+            -DCMAKE_CXX_FLAGS_RELEASE='-Oz -flto -DNDEBUG' \
+            -DCMAKE_EXE_LINKER_FLAGS_RELEASE='-Wl,--strip-all'
+
+      - name: Build ELF
+        run: make -C build -j$(nproc)
+
+      - name: Generate NRO
+        run: |
+          nacptool --create 'Pico-8 Downloader' 'YourName' '1.0.0' build/pico8_downloader.nacp
+          elf2nro build/pico8_downloader.elf pico8-downloader.nro \
+            --nacp=build/pico8_downloader.nacp
+
+      - name: Upload NRO Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico8-downloader-nro
+          path: pico8-downloader.nro
