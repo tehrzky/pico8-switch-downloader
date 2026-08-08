@@ -5,9 +5,9 @@
 
 int main(int argc, char **argv) {
     consoleInit(NULL);
-    socketInitializeDefault(); // Initialize network stack
+    socketInitializeDefault();
 
-    // Configure and initialize gamepad input
+    // Initialize controller state
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
