@@ -29,13 +29,21 @@ target_link_directories(pico8_downloader PRIVATE
 
 # devkitPro portlibs require exact case-sensitive names (SDL2, SDL2_image, SDL2_ttf)
 target_link_libraries(pico8_downloader PRIVATE
+    SDL2_ttf
+    SDL2_image
+    SDL2
+    EGL
+    GLESv2
+    glapi
+    drm_nouveau
+    freetype
+    png
+    jpeg
+    webp
     curl
     mbedtls
     mbedcrypto
     mbedx509
     z
-    SDL2
-    SDL2_image
-    SDL2_ttf
     nx
 )
