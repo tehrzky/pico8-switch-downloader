@@ -4,7 +4,18 @@ project(pico8_downloader CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(include)
+# Include local headers, portlibs (cURL, SDL2, etc.), and libnx headers
+include_directories(
+    include
+    $ENV{PORTLIBS}/switch/include
+    $ENV{DEVKITPRO}/libnx/include
+)
+
+# Specify library search paths
+link_directories(
+    $ENV{PORTLIBS}/switch/lib
+    $ENV{DEVKITPRO}/libnx/lib
+)
 
 file(GLOB SOURCES "source/*.cpp")
 
