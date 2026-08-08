@@ -5,7 +5,12 @@
 
 int main(int argc, char **argv) {
     consoleInit(NULL);
-    socketInitializeDefault(); // Required for network stack on Switch
+    socketInitializeDefault(); // Initialize network stack
+
+    // Configure and initialize gamepad input
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
 
     load_config();
 
@@ -28,9 +33,9 @@ int main(int argc, char **argv) {
             bool success = download_file("https://www.lexaloffle.com/bbs/cdata/0/celeste.p8.png", dest);
 
             if (success) {
-                printf("\x1b[9;1HDownload successful!");
+                printf("\x1b[9;1HDownload successful!  ");
             } else {
-                printf("\x1b[9;1HDownload failed. Verify network connection.");
+                printf("\x1b[9;1HDownload failed.      ");
             }
         }
 
