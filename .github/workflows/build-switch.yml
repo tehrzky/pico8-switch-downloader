@@ -1,0 +1,41 @@
+name: Build Switch Application
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        shell: bash
+        run: |
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm \
+            switch-curl \
+            switch-mbedtls \
+            switch-zlib \
+            switch-sdl2 \
+            switch-tools
+
+      - name: Build NRO Binary
+        shell: bash
+        run: |
+          make -j$(nproc)
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico8-downloader-nro
+          path: |
+            *.nro
