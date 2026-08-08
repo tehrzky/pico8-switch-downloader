@@ -4,37 +4,38 @@ project(pico8_downloader CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Resolve DEVKITPRO root path
 set(DEVKITPRO /opt/devkitpro)
 if(DEFINED ENV{DEVKITPRO})
     set(DEVKITPRO $ENV{DEVKITPRO})
 endif()
 
-# Include directories for local headers, portlibs (curl, sdl2), and libnx
-include_directories(
+file(GLOB SOURCES "source/*.cpp")
+
+add_executable(pico8_downloader ${SOURCES})
+
+# Force output filename to be pico8_downloader.elf
+set_target_properties(pico8_downloader PROPERTIES SUFFIX ".elf")
+
+target_include_directories(pico8_downloader PRIVATE
     include
     ${DEVKITPRO}/portlibs/switch/include
     ${DEVKITPRO}/libnx/include
 )
 
-# Search directories for libraries
-link_directories(
+target_link_directories(pico8_downloader PRIVATE
     ${DEVKITPRO}/portlibs/switch/lib
     ${DEVKITPRO}/libnx/lib
 )
 
-file(GLOB SOURCES "source/*.cpp")
-
-add_executable(pico8_downloader.elf ${SOURCES})
-
-target_link_libraries(pico8_downloader.elf
+# devkitPro portlibs require exact case-sensitive names (SDL2, SDL2_image, SDL2_ttf)
+target_link_libraries(pico8_downloader PRIVATE
     curl
     mbedtls
     mbedcrypto
     mbedx509
     z
-    sdl2
-    sdl2_image
-    sdl2_ttf
+    SDL2
+    SDL2_image
+    SDL2_ttf
     nx
 )
