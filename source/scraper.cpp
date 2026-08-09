@@ -153,9 +153,26 @@ void resolve_cart_detail(CartItem& item) {
     }
 
     // Thumbnail preview image, if we can find one.
-    static const std::regex thumb_re(R"((https?://[^\"'\s>]*/bbs/thumbs/[^\"'\s>]+\.(?:png|gif)))");
+    static const std::regex thumb_re(R"((https?://[^\"'\s>]*/bbs/thums?/[^\"'\s>]+\.(?:png|gif)))");
     if (std::regex_search(html, m, thumb_re)) {
         item.thumbnail_url = m[1].str();
+    } else {
+        // Fallback: the strict "thumbs" path didn't match - try any image reference
+        // near the top of the page that isn't obvious site chrome (nav icons, logos,
+        // avatars). This is a looser heuristic in case the site's actual thumbnail
+        // path differs from what we assumed.
+        std::string head = html.substr(0, std::min<size_t>(html.size(), 6000));
+        static const std::regex loose_img_re(R"(<img[^>]+src=\"(https?://[^\"]+\.(?:png|gif))\")");
+        auto begin = std::sregex_iterator(head.begin(), head.end(), loose_img_re);
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            std::string candidate = (*it)[1].str();
+            if (candidate.find("/gfx/") != std::string::npos) continue;
+            if (candidate.find("/icons/") != std::string::npos) continue;
+            if (candidate.find("avatar") != std::string::npos) continue;
+            item.thumbnail_url = candidate;
+            break;
+        }
     }
 }
 

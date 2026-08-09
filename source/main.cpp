@@ -152,16 +152,16 @@ int main(int argc, char **argv) {
                                           SCREEN_WIDTH, SCREEN_HEIGHT, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
-    // Load fonts from the SD card. We try a few candidate locations, in order,
-    // since we can't be 100% sure where they ended up - this makes font loading
-    // resilient instead of silently failing with no on-screen way to tell why.
+    // Load fonts. Try the auto-bundled copy inside the .nro (romfs) first - if that
+    // works, zero setup is needed on the SD card at all. Fall back to a manual SD
+    // copy only if the bundled one can't be opened for some reason.
     const char* regular_candidates[] = {
-        "sdmc:/switch/pico8-downloader/PTSans-Regular.ttf",
         "romfs:/PTSans-Regular.ttf",
+        "sdmc:/switch/pico8-downloader/PTSans-Regular.ttf",
     };
     const char* bold_candidates[] = {
-        "sdmc:/switch/pico8-downloader/PTSans-Bold.ttf",
         "romfs:/PTSans-Bold.ttf",
+        "sdmc:/switch/pico8-downloader/PTSans-Bold.ttf",
     };
     std::string font_regular_path, font_bold_path;
     TTF_Font* font_header = nullptr;
@@ -183,6 +183,8 @@ int main(int argc, char **argv) {
     // still show a visible, font-independent signal so this is diagnosable from
     // a screenshot instead of just being invisible.
     bool fonts_ok = (font_header && font_bold && font_body && font_small);
+    std::string font_source = font_regular_path.empty() ? "none" :
+        (font_regular_path.find("romfs:") == 0 ? "romfs (auto)" : "sdmc (manual copy)");
     TextCache text_cache;
 
     load_config();
@@ -200,6 +202,8 @@ int main(int argc, char **argv) {
     std::string status_message = "Press Y to load carts from the BBS.";
     bool status_is_error = false;
     bool has_loaded_once = false;
+    std::string thumb_fetch_status; // sticky diagnostic, set the first time something's learned about covers
+    std::string debug_line;         // per-selected-card diagnostic, refreshed each frame
 
     const char* filters_label[] = { "FEATURED", "NEW", "POPULAR", "TOP RATED" };
     const CartFilter filters_value[] = { CartFilter::Featured, CartFilter::New, CartFilter::Popular, CartFilter::TopRated };
@@ -367,22 +371,40 @@ int main(int argc, char **argv) {
             if (g_download_thread.joinable()) g_download_thread.join();
         }
 
-        // --- Lazily resolve detail + thumbnail for the currently selected card ---
-        if (focus == Focus::RESULTS && !carts.empty() && (size_t)selected_cart < carts.size()) {
-            CartItem& sel = carts[selected_cart];
-            if (!sel.detail_resolved) {
-                resolve_cart_detail(sel);
+        // --- Eagerly resolve detail + thumbnail for every visible card (up to 4) ---
+        // so we're not only trying the one currently selected - gives us more
+        // data points if something's still not loading.
+        for (size_t i = 0; i < carts.size() && i < 4; i++) {
+            CartItem& c = carts[i];
+            if (!c.detail_resolved) {
+                resolve_cart_detail(c);
             }
-            if (!sel.thumbnail_url.empty() && thumb_textures.find(sel.tid) == thumb_textures.end()) {
+            if (!c.thumbnail_url.empty() && thumb_textures.find(c.tid) == thumb_textures.end()) {
                 std::vector<unsigned char> bytes;
-                if (http_get_binary(sel.thumbnail_url, bytes)) {
+                if (http_get_binary(c.thumbnail_url, bytes)) {
                     SDL_RWops* rw = SDL_RWFromMem(bytes.data(), (int)bytes.size());
                     SDL_Surface* surf = IMG_Load_RW(rw, 1);
                     if (surf) {
-                        thumb_textures[sel.tid] = SDL_CreateTextureFromSurface(renderer, surf);
+                        thumb_textures[c.tid] = SDL_CreateTextureFromSurface(renderer, surf);
                         SDL_FreeSurface(surf);
+                    } else {
+                        thumb_fetch_status = "cover found but image decode failed";
                     }
+                } else {
+                    thumb_fetch_status = "cover URL found but download failed";
                 }
+            } else if (c.detail_resolved && c.thumbnail_url.empty() && thumb_fetch_status.empty()) {
+                thumb_fetch_status = "no cover image found on cart's BBS page";
+            }
+        }
+
+        // --- Debug line for the currently selected card, so we can see exactly
+        // what the scraper did (or didn't) find for it ---
+        if (focus == Focus::RESULTS && !carts.empty() && (size_t)selected_cart < carts.size()) {
+            CartItem& sel = carts[selected_cart];
+            if (sel.detail_resolved) {
+                debug_line = "cover: " + (sel.thumbnail_url.empty() ? std::string("not found") : std::string("found")) +
+                             "  |  cart file: " + (sel.download_url.empty() ? std::string("not found") : std::string("found"));
             }
         }
 
@@ -439,7 +461,16 @@ int main(int argc, char **argv) {
         // Status / error message
         {
             SDL_Color msg_color = status_is_error ? COLOR_ERROR : COLOR_MUTED;
-            draw_text(renderer, text_cache, font_small, status_message, 35, 600, msg_color, 320);
+            draw_text(renderer, text_cache, font_small, status_message, 35, 560, msg_color, 320);
+        }
+        // Diagnostics: font source, and what the scraper found for the selected card.
+        // Temporary but genuinely useful while we're tracking down the cover-image issue.
+        draw_text(renderer, text_cache, font_small, "font: " + font_source, 35, 585, COLOR_MUTED, 320);
+        if (!thumb_fetch_status.empty()) {
+            draw_text(renderer, text_cache, font_small, thumb_fetch_status, 35, 605, COLOR_MUTED, 320);
+        }
+        if (!debug_line.empty()) {
+            draw_text(renderer, text_cache, font_small, debug_line, 35, 625, COLOR_MUTED, 320);
         }
 
         // --- RIGHT GRID AREA (Cartridge Cards) ---
