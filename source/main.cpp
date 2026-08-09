@@ -152,11 +152,37 @@ int main(int argc, char **argv) {
                                           SCREEN_WIDTH, SCREEN_HEIGHT, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
-    // Fonts bundled in romfs (see romfs/ folder + --romfsdir at build time).
-    TTF_Font* font_header = TTF_OpenFont("romfs:/PTSans-Bold.ttf", 24);
-    TTF_Font* font_bold   = TTF_OpenFont("romfs:/PTSans-Bold.ttf", 20);
-    TTF_Font* font_body   = TTF_OpenFont("romfs:/PTSans-Regular.ttf", 18);
-    TTF_Font* font_small  = TTF_OpenFont("romfs:/PTSans-Regular.ttf", 15);
+    // Load fonts from the SD card. We try a few candidate locations, in order,
+    // since we can't be 100% sure where they ended up - this makes font loading
+    // resilient instead of silently failing with no on-screen way to tell why.
+    const char* regular_candidates[] = {
+        "sdmc:/switch/pico8-downloader/PTSans-Regular.ttf",
+        "romfs:/PTSans-Regular.ttf",
+    };
+    const char* bold_candidates[] = {
+        "sdmc:/switch/pico8-downloader/PTSans-Bold.ttf",
+        "romfs:/PTSans-Bold.ttf",
+    };
+    std::string font_regular_path, font_bold_path;
+    TTF_Font* font_header = nullptr;
+    TTF_Font* font_bold   = nullptr;
+    TTF_Font* font_body   = nullptr;
+    TTF_Font* font_small  = nullptr;
+    for (const char* p : bold_candidates) {
+        font_header = TTF_OpenFont(p, 24);
+        if (font_header) { font_bold_path = p; break; }
+    }
+    if (!font_bold_path.empty()) font_bold = TTF_OpenFont(font_bold_path.c_str(), 20);
+    for (const char* p : regular_candidates) {
+        font_body = TTF_OpenFont(p, 18);
+        if (font_body) { font_regular_path = p; break; }
+    }
+    if (!font_regular_path.empty()) font_small = TTF_OpenFont(font_regular_path.c_str(), 15);
+
+    // If every candidate failed, we have no way to draw text at all - but we can
+    // still show a visible, font-independent signal so this is diagnosable from
+    // a screenshot instead of just being invisible.
+    bool fonts_ok = (font_header && font_bold && font_body && font_small);
     TextCache text_cache;
 
     load_config();
@@ -363,6 +389,11 @@ int main(int argc, char **argv) {
         // Render Background
         SDL_SetRenderDrawColor(renderer, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, 255);
         SDL_RenderClear(renderer);
+
+        // Font-independent diagnostic strip: RED = fonts failed to load (no text
+        // will ever appear, by design, since draw_text() needs a valid font).
+        // GREEN = fonts loaded fine, so any missing text is a different problem.
+        draw_rect(renderer, 0, 0, SCREEN_WIDTH, 6, fonts_ok ? SDL_Color{0,200,0,255} : SDL_Color{220,0,0,255});
 
         // --- TOP HEADER BAR ---
         draw_rect(renderer, 0, 0, SCREEN_WIDTH, 45, COLOR_PANEL);
