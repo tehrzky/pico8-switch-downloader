@@ -3,6 +3,7 @@
 #include <regex>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 
 namespace {
 
@@ -19,11 +20,16 @@ size_t bytes_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return total;
 }
 
-bool http_get_text(const std::string& url, std::string& out) {
+// Fetches a URL as text. On return, http_code and curl_err are always filled in
+// (even on success) so callers can report exactly what happened, not just "failed".
+bool http_get_text(const std::string& url, std::string& out, long& http_code, std::string& curl_err) {
+    http_code = 0;
+    curl_err.clear();
     CURL* curl = curl_easy_init();
-    if (!curl) return false;
+    if (!curl) { curl_err = "curl_easy_init failed"; return false; }
     out.clear();
 
+    char errbuf[CURL_ERROR_SIZE] = {0};
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, string_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
@@ -31,12 +37,18 @@ bool http_get_text(const std::string& url, std::string& out) {
                       "Mozilla/5.0 (Nintendo Switch) Pico8SwitchDownloader/1.0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
     CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        curl_err = std::string(curl_easy_strerror(res));
+        if (errbuf[0]) curl_err += " (" + std::string(errbuf) + ")";
+    }
 
     return (res == CURLE_OK) && (http_code == 200);
 }
@@ -74,12 +86,43 @@ std::string url_encode(const std::string& in) {
 
 std::string filter_query(CartFilter f) {
     switch (f) {
-        case CartFilter::New:      return "orderby=ts";
-        case CartFilter::Popular:  return "orderby=ts&popular=1";
+        case CartFilter::New:      return "orderby=new";
+        case CartFilter::Popular:  return "orderby=featured&popular=1";
         case CartFilter::TopRated: return "orderby=favourite";
         case CartFilter::Featured:
-        default:                   return "orderby=lucky";
+        default:                   return "orderby=featured";
     }
+}
+
+// Cart file / thumbnail hrefs on the BBS are often relative (e.g.
+// "/bbs/cposts/sn/xxx.p8.png") rather than full URLs. This makes sure we always
+// end up with something curl can fetch directly.
+std::string absolute_url(const std::string& href) {
+    if (href.empty()) return href;
+    if (href.rfind("http://", 0) == 0 || href.rfind("https://", 0) == 0) return href;
+    if (href[0] == '/') return "https://www.lexaloffle.com" + href;
+    return "https://www.lexaloffle.com/bbs/" + href;
+}
+
+// Dumps whatever we fetched to the SD card so it can be inspected off-device.
+// Always overwrites the same file, so it always reflects the most recent fetch.
+void dump_debug(const std::string& label, const std::string& url, long http_code,
+                 const std::string& curl_err, const std::string& body) {
+    std::ofstream f("sdmc:/switch/pico8-downloader/debug_last_fetch.txt", std::ios::trunc);
+    if (!f.is_open()) return;
+    f << "=== " << label << " ===\n";
+    f << "URL: " << url << "\n";
+    f << "HTTP code: " << http_code << "\n";
+    f << "curl error: " << (curl_err.empty() ? "(none)" : curl_err) << "\n";
+    f << "Body length: " << body.size() << " bytes\n";
+    f << "occurrences of \"tid=\": " << [&]{
+        size_t count = 0, pos = 0;
+        while ((pos = body.find("tid=", pos)) != std::string::npos) { count++; pos += 4; }
+        return count;
+    }() << "\n";
+    f << "--- first 4000 bytes of body ---\n";
+    f << body.substr(0, 4000) << "\n";
+    f.close();
 }
 
 } // namespace
@@ -92,31 +135,33 @@ bool fetch_cart_list(CartFilter filter,
     out_items.clear();
     out_error.clear();
 
-    std::string url = "https://www.lexaloffle.com/bbs/lister.php?cat=7&mode=carts&sub=2&page=" +
+    std::string url = "https://www.lexaloffle.com/bbs/?cat=7&sub=2&mode=carts&page=" +
                        std::to_string(page) + "&" + filter_query(filter);
     if (!search.empty()) {
         url += "&keywords=" + url_encode(search);
     }
 
     std::string html;
-    if (!http_get_text(url, html)) {
-        out_error = "Couldn't reach lexaloffle.com. Check your Switch's internet connection.";
+    long http_code = 0;
+    std::string curl_err;
+    bool ok = http_get_text(url, html, http_code, curl_err);
+    dump_debug("fetch_cart_list", url, http_code, curl_err, html);
+
+    if (!ok) {
+        out_error = "Fetch failed: HTTP " + std::to_string(http_code) +
+                    (curl_err.empty() ? "" : (" - " + curl_err));
         return false;
     }
 
-    // Cart entries are anchor tags linking to a thread id, e.g.:
-    //   <a href="/bbs/?tid=46754" ...>Still a Magical Girl</a>
-    static const std::regex item_re(R"(<a[^>]+href=\"[^\"]*[?&]tid=(\d+)\"[^>]*>([^<]+)</a>)");
+    // Primary pattern: <a href="...?tid=NNNN" ...>Title</a> (double quotes)
+    static const std::regex item_re(R"(<a[^>]+href=["'][^"']*[?&]tid=(\d+)["'][^>]*>([^<]+)</a>)");
     auto begin = std::sregex_iterator(html.begin(), html.end(), item_re);
     auto end = std::sregex_iterator();
 
     for (auto it = begin; it != end; ++it) {
         std::string tid = (*it)[1].str();
-
         bool dup = false;
-        for (auto& existing : out_items) {
-            if (existing.tid == tid) { dup = true; break; }
-        }
+        for (auto& existing : out_items) if (existing.tid == tid) { dup = true; break; }
         if (dup) continue;
 
         CartItem item;
@@ -127,7 +172,11 @@ bool fetch_cart_list(CartFilter filter,
     }
 
     if (out_items.empty()) {
-        out_error = "No carts found for this filter/search.";
+        size_t tid_count = 0, pos = 0;
+        while ((pos = html.find("tid=", pos)) != std::string::npos) { tid_count++; pos += 4; }
+        out_error = "Parsed 0 carts from a " + std::to_string(html.size()) +
+                    "-byte response (found \"tid=\" " + std::to_string(tid_count) +
+                    " times) - check sdmc:/switch/pico8-downloader/debug_last_fetch.txt";
     }
     return true;
 }
@@ -137,32 +186,38 @@ void resolve_cart_detail(CartItem& item) {
     if (item.tid.empty()) return;
 
     std::string html;
-    if (!http_get_text(item.thread_url, html)) return;
+    long http_code = 0;
+    std::string curl_err;
+    if (!http_get_text(item.thread_url, html, http_code, curl_err)) return;
 
-    // Author: "...?uid=123"><b>Name</b>" style link near the top of the thread.
-    static const std::regex author_re(R"(\?uid=\d+\"[^>]*>\s*<b>([^<]+)</b>)");
+    // Author: an <a href="/bbs/?uid=NNN">Name</a> link - no assumption about
+    // bold/other formatting around it.
+    static const std::regex author_re(R"(<a[^>]+href=["'][^"']*[?&]uid=\d+["'][^>]*>([^<]+)</a>)");
     std::smatch m;
     if (std::regex_search(html, m, author_re)) {
         item.author = decode_entities(m[1].str());
     }
 
-    // The cartridge file itself is always named "*.p8.png" wherever it's linked from.
-    static const std::regex cart_re(R"((https?://[^\"'\s>]+\.p8\.png))");
-    if (std::regex_search(html, m, cart_re)) {
-        item.download_url = m[1].str();
+    // Cart file: the BBS marks the real download link with title="Open Cartridge File".
+    // Its href is very often a *relative* path (e.g. "/bbs/cposts/sn/xxx.p8.png"),
+    // not a full URL - handle attributes in either order and resolve relative links.
+    static const std::regex cart_re1(R"(<a[^>]+href=["']([^"']+\.p8\.png)["'][^>]*title=["']Open Cartridge File["'])");
+    static const std::regex cart_re2(R"(<a[^>]+title=["']Open Cartridge File["'][^>]*href=["']([^"']+\.p8\.png)["'])");
+    // Fallback: any *.p8.png reference at all, relative or absolute.
+    static const std::regex cart_re_fallback(R"(["']([^"'\s>]+\.p8\.png)["'])");
+    if (std::regex_search(html, m, cart_re1) || std::regex_search(html, m, cart_re2) ||
+        std::regex_search(html, m, cart_re_fallback)) {
+        item.download_url = absolute_url(m[1].str());
     }
 
-    // Thumbnail preview image, if we can find one.
-    static const std::regex thumb_re(R"((https?://[^\"'\s>]*/bbs/thums?/[^\"'\s>]+\.(?:png|gif)))");
+    // Thumbnail: any <img src="..."> whose path contains "/bbs/thumbs/" (also
+    // often relative).
+    static const std::regex thumb_re(R"(<img[^>]+src=["']([^"']*\/bbs\/thumbs\/[^"']+\.(?:png|gif))["'])");
     if (std::regex_search(html, m, thumb_re)) {
-        item.thumbnail_url = m[1].str();
+        item.thumbnail_url = absolute_url(m[1].str());
     } else {
-        // Fallback: the strict "thumbs" path didn't match - try any image reference
-        // near the top of the page that isn't obvious site chrome (nav icons, logos,
-        // avatars). This is a looser heuristic in case the site's actual thumbnail
-        // path differs from what we assumed.
         std::string head = html.substr(0, std::min<size_t>(html.size(), 6000));
-        static const std::regex loose_img_re(R"(<img[^>]+src=\"(https?://[^\"]+\.(?:png|gif))\")");
+        static const std::regex loose_img_re(R"(<img[^>]+src=["']([^"']+\.(?:png|gif))["'])");
         auto begin = std::sregex_iterator(head.begin(), head.end(), loose_img_re);
         auto end = std::sregex_iterator();
         for (auto it = begin; it != end; ++it) {
@@ -170,7 +225,7 @@ void resolve_cart_detail(CartItem& item) {
             if (candidate.find("/gfx/") != std::string::npos) continue;
             if (candidate.find("/icons/") != std::string::npos) continue;
             if (candidate.find("avatar") != std::string::npos) continue;
-            item.thumbnail_url = candidate;
+            item.thumbnail_url = absolute_url(candidate);
             break;
         }
     }
@@ -188,6 +243,7 @@ bool http_get_binary(const std::string& url, std::vector<unsigned char>& out) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Pico8SwitchDownloader/1.0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
 
     CURLcode res = curl_easy_perform(curl);
