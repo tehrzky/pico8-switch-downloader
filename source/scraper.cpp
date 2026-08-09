@@ -20,8 +20,6 @@ size_t bytes_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return total;
 }
 
-// Fetches a URL as text. On return, http_code and curl_err are always filled in
-// (even on success) so callers can report exactly what happened, not just "failed".
 bool http_get_text(const std::string& url, std::string& out, long& http_code, std::string& curl_err) {
     http_code = 0;
     curl_err.clear();
@@ -94,9 +92,6 @@ std::string filter_query(CartFilter f) {
     }
 }
 
-// Cart file / thumbnail hrefs on the BBS are often relative (e.g.
-// "/bbs/cposts/sn/xxx.p8.png") rather than full URLs. This makes sure we always
-// end up with something curl can fetch directly.
 std::string absolute_url(const std::string& href) {
     if (href.empty()) return href;
     if (href.rfind("http://", 0) == 0 || href.rfind("https://", 0) == 0) return href;
@@ -104,8 +99,6 @@ std::string absolute_url(const std::string& href) {
     return "https://www.lexaloffle.com/bbs/" + href;
 }
 
-// Dumps whatever we fetched to the SD card so it can be inspected off-device.
-// Always overwrites the same file, so it always reflects the most recent fetch.
 void dump_debug(const std::string& label, const std::string& url, long http_code,
                  const std::string& curl_err, const std::string& body) {
     std::ofstream f("sdmc:/switch/pico8-downloader/debug_last_fetch.txt", std::ios::trunc);
@@ -116,11 +109,19 @@ void dump_debug(const std::string& label, const std::string& url, long http_code
     f << "curl error: " << (curl_err.empty() ? "(none)" : curl_err) << "\n";
     f << "Body length: " << body.size() << " bytes\n";
 
-    size_t tid_count = 0, pos = 0;
-    while ((pos = body.find("tid=", pos)) != std::string::npos) { tid_count++; pos += 4; }
-    f << "occurrences of \"tid=\": " << tid_count << "\n";
-    f << "--- first 800 bytes ---\n";
-    f << body.substr(0, 800) << "\n";
+    size_t shown = 0, pos = 0;
+    f << "--- full markup for the first 2 card blocks (1400 chars each) ---\n";
+    while ((pos = body.find("tid=", pos)) != std::string::npos && shown < 2) {
+        size_t start = (pos > 20) ? pos - 20 : 0;
+        size_t len = std::min<size_t>(1400, body.size() - start);
+        f << "\n[card " << (shown + 1) << " starting near byte " << pos << "]\n";
+        f << body.substr(start, len) << "\n";
+        pos = start + len;
+        shown++;
+    }
+
+    f << "\n--- first 2000 bytes of body (for reference) ---\n";
+    f << body.substr(0, 2000) << "\n";
     f.close();
 }
 
@@ -152,12 +153,7 @@ bool fetch_cart_list(CartFilter filter,
         return false;
     }
 
-    // Cards look like:
-    //   <a href="?tid=150672">
-    //       <div ...><div ...>Crimson Night</div></div>
-    //   </a>
-    // Title text is nested two <div>s inside the link, not inline.
-    static const std::regex item_re(R"(<a\s+href="\?tid=(\d+)">\s*<div[^>]*>\s*<div[^>]*>([^<]+)</div>)");
+    static const std::regex item_re(R"(<a[^>]+href=["'][^"']*[?&]tid=(\d+)["'][^>]*>([^<]+)</a>)");
     auto begin = std::sregex_iterator(html.begin(), html.end(), item_re);
     auto end = std::sregex_iterator();
 
@@ -193,28 +189,20 @@ void resolve_cart_detail(CartItem& item) {
     std::string curl_err;
     if (!http_get_text(item.thread_url, html, http_code, curl_err)) return;
 
-    // Author: an <a href="/bbs/?uid=NNN">Name</a> link - no assumption about
-    // bold/other formatting around it.
     static const std::regex author_re(R"(<a[^>]+href=["'][^"']*[?&]uid=\d+["'][^>]*>([^<]+)</a>)");
     std::smatch m;
     if (std::regex_search(html, m, author_re)) {
         item.author = decode_entities(m[1].str());
     }
 
-    // Cart file: the BBS marks the real download link with title="Open Cartridge File".
-    // Its href is very often a *relative* path (e.g. "/bbs/cposts/sn/xxx.p8.png"),
-    // not a full URL - handle attributes in either order and resolve relative links.
     static const std::regex cart_re1(R"(<a[^>]+href=["']([^"']+\.p8\.png)["'][^>]*title=["']Open Cartridge File["'])");
     static const std::regex cart_re2(R"(<a[^>]+title=["']Open Cartridge File["'][^>]*href=["']([^"']+\.p8\.png)["'])");
-    // Fallback: any *.p8.png reference at all, relative or absolute.
     static const std::regex cart_re_fallback(R"(["']([^"'\s>]+\.p8\.png)["'])");
     if (std::regex_search(html, m, cart_re1) || std::regex_search(html, m, cart_re2) ||
         std::regex_search(html, m, cart_re_fallback)) {
         item.download_url = absolute_url(m[1].str());
     }
 
-    // Thumbnail: any <img src="..."> whose path contains "/bbs/thumbs/" (also
-    // often relative).
     static const std::regex thumb_re(R"(<img[^>]+src=["']([^"']*\/bbs\/thumbs\/[^"']+\.(?:png|gif))["'])");
     if (std::regex_search(html, m, thumb_re)) {
         item.thumbnail_url = absolute_url(m[1].str());
