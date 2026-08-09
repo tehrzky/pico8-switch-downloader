@@ -110,13 +110,13 @@ void dump_debug(const std::string& label, const std::string& url, long http_code
     f << "Body length: " << body.size() << " bytes\n";
 
     size_t shown = 0, pos = 0;
-    f << "--- context around each \"tid=\" occurrence (first 6) ---\n";
-    while ((pos = body.find("tid=", pos)) != std::string::npos && shown < 6) {
-        size_t start = (pos > 150) ? pos - 150 : 0;
-        size_t len = std::min<size_t>(300, body.size() - start);
-        f << "\n[occurrence " << (shown + 1) << " at byte " << pos << "]\n";
+    f << "--- full markup for the first 2 card blocks (1400 chars each) ---\n";
+    while ((pos = body.find("tid=", pos)) != std::string::npos && shown < 2) {
+        size_t start = (pos > 20) ? pos - 20 : 0;
+        size_t len = std::min<size_t>(1400, body.size() - start);
+        f << "\n[card " << (shown + 1) << " starting near byte " << pos << "]\n";
         f << body.substr(start, len) << "\n";
-        pos += 4;
+        pos = start + len;
         shown++;
     }
 
