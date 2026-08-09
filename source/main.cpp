@@ -152,16 +152,16 @@ int main(int argc, char **argv) {
                                           SCREEN_WIDTH, SCREEN_HEIGHT, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
-    // Load fonts. Try the auto-bundled copy inside the .nro (romfs) first - if that
-    // works, zero setup is needed on the SD card at all. Fall back to a manual SD
-    // copy only if the bundled one can't be opened for some reason.
+    // Load fonts. The SD-card copy is the proven-reliable path (romfs bundling via
+    // GitHub's web editor tends to corrupt binary .ttf files when pasted as text),
+    // so we try that first and only attempt romfs as a bonus fallback.
     const char* regular_candidates[] = {
-        "romfs:/PTSans-Regular.ttf",
         "sdmc:/switch/pico8-downloader/PTSans-Regular.ttf",
+        "romfs:/PTSans-Regular.ttf",
     };
     const char* bold_candidates[] = {
-        "romfs:/PTSans-Bold.ttf",
         "sdmc:/switch/pico8-downloader/PTSans-Bold.ttf",
+        "romfs:/PTSans-Bold.ttf",
     };
     std::string font_regular_path, font_bold_path;
     TTF_Font* font_header = nullptr;
@@ -421,6 +421,12 @@ int main(int argc, char **argv) {
         draw_rect(renderer, 0, 0, SCREEN_WIDTH, 45, COLOR_PANEL);
         draw_rect(renderer, 0, 44, SCREEN_WIDTH, 1, COLOR_BORDER);
         draw_text(renderer, text_cache, font_header, "PICO-8 Cart Browser & Downloader v1.0", 20, 8, COLOR_WHITE);
+        {
+            const char* credit = "by tehrzky";
+            int cw = 0, ch = 0;
+            if (font_body) TTF_SizeUTF8(font_body, credit, &cw, &ch);
+            draw_text(renderer, text_cache, font_body, credit, SCREEN_WIDTH - cw - 20, 13, COLOR_MUTED);
+        }
 
         // --- LEFT SIDEBAR (Filters & Settings) ---
         draw_rect(renderer, 20, 60, 360, 610, COLOR_PANEL);
