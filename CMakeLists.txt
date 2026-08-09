@@ -16,6 +16,11 @@ add_executable(pico8_downloader ${SOURCES})
 # Force output filename to be pico8_downloader.elf
 set_target_properties(pico8_downloader PROPERTIES SUFFIX ".elf")
 
+# main.cpp downloads files on a background std::thread so the UI doesn't freeze
+# and the progress bar can update live - needs pthreads support.
+find_package(Threads REQUIRED)
+target_link_libraries(pico8_downloader PRIVATE Threads::Threads)
+
 target_include_directories(pico8_downloader PRIVATE
     include
     ${DEVKITPRO}/portlibs/switch/include
