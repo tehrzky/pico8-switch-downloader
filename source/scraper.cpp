@@ -109,19 +109,11 @@ void dump_debug(const std::string& label, const std::string& url, long http_code
     f << "curl error: " << (curl_err.empty() ? "(none)" : curl_err) << "\n";
     f << "Body length: " << body.size() << " bytes\n";
 
-    size_t shown = 0, pos = 0;
-    f << "--- full markup for the first 2 card blocks (1400 chars each) ---\n";
-    while ((pos = body.find("tid=", pos)) != std::string::npos && shown < 2) {
-        size_t start = (pos > 20) ? pos - 20 : 0;
-        size_t len = std::min<size_t>(1400, body.size() - start);
-        f << "\n[card " << (shown + 1) << " starting near byte " << pos << "]\n";
-        f << body.substr(start, len) << "\n";
-        pos = start + len;
-        shown++;
-    }
-
-    f << "\n--- first 2000 bytes of body (for reference) ---\n";
-    f << body.substr(0, 2000) << "\n";
+    size_t tid_count = 0, pos = 0;
+    while ((pos = body.find("tid=", pos)) != std::string::npos) { tid_count++; pos += 4; }
+    f << "occurrences of \"tid=\": " << tid_count << "\n";
+    f << "--- first 800 bytes ---\n";
+    f << body.substr(0, 800) << "\n";
     f.close();
 }
 
@@ -153,7 +145,12 @@ bool fetch_cart_list(CartFilter filter,
         return false;
     }
 
-    static const std::regex item_re(R"(<a[^>]+href=["'][^"']*[?&]tid=(\d+)["'][^>]*>([^<]+)</a>)");
+    // Cards look like:
+    //   <a href="?tid=150672">
+    //       <div ...><div ...>Crimson Night</div></div>
+    //   </a>
+    // Title text is nested two <div>s inside the link, not inline.
+    static const std::regex item_re(R"RX(<a\s+href="\?tid=(\d+)">\s*<div[^>]*>\s*<div[^>]*>([^<]+)</div>)RX");
     auto begin = std::sregex_iterator(html.begin(), html.end(), item_re);
     auto end = std::sregex_iterator();
 
