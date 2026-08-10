@@ -57,17 +57,20 @@ static std::vector<CartItem> g_fetched_carts;
 static std::string        g_fetch_error;
 static bool               g_fetch_error_flag = false;
 
-// --- Background detail + thumbnail worker ---
+// --- Background detail worker result queue ---
+// The worker NEVER touches the main carts vector. It works on a copy
+// and pushes results here. Main thread applies them safely.
+struct DetailResult {
+    std::string tid;
+    std::string author;
+    std::string download_url;
+    std::string thumbnail_url;
+    std::vector<unsigned char> thumb_bytes;
+};
 static std::atomic<bool>  g_detail_worker_active{false};
 static std::thread        g_detail_worker_thread;
-
-// --- Thumbnail bytes queue (producer = worker thread, consumer = main thread) ---
-struct ThumbPayload {
-    std::string tid;
-    std::vector<unsigned char> bytes;
-};
-static std::mutex g_thumb_queue_mtx;
-static std::vector<ThumbPayload> g_thumb_queue;
+static std::mutex         g_detail_queue_mtx;
+static std::vector<DetailResult> g_detail_queue;
 
 // --- Text texture cache ---
 struct TextCache {
@@ -161,23 +164,27 @@ static std::string prompt_keyboard(const std::string& guide, const std::string& 
 }
 
 // ------------------------------------------------------------------
-// Background worker: resolve details + download thumbnail bytes
+// Background worker: resolves details on a COPY, pushes to queue
 // ------------------------------------------------------------------
-static void detail_worker_loop(std::vector<CartItem>* carts_ptr) {
-    std::vector<CartItem>& carts = *carts_ptr;
-    for (size_t i = 0; i < carts.size() && g_detail_worker_active.load(); ++i) {
-        CartItem& c = carts[i];
+static void detail_worker_loop(std::vector<CartItem> carts_copy) {
+    for (auto& c : carts_copy) {
+        if (!g_detail_worker_active.load()) break;
         if (c.detail_resolved) continue;
 
         resolve_cart_detail(c);
 
+        DetailResult res;
+        res.tid = c.tid;
+        res.author = c.author;
+        res.download_url = c.download_url;
+        res.thumbnail_url = c.thumbnail_url;
+
         if (!c.thumbnail_url.empty()) {
-            std::vector<unsigned char> bytes;
-            if (http_get_binary(c.thumbnail_url, bytes) && !bytes.empty()) {
-                std::lock_guard<std::mutex> lk(g_thumb_queue_mtx);
-                g_thumb_queue.push_back({c.tid, std::move(bytes)});
-            }
+            http_get_binary(c.thumbnail_url, res.thumb_bytes);
         }
+
+        std::lock_guard<std::mutex> lk(g_detail_queue_mtx);
+        g_detail_queue.push_back(std::move(res));
     }
     g_detail_worker_active.store(false);
 }
@@ -187,17 +194,23 @@ static void stop_detail_worker() {
     if (g_detail_worker_thread.joinable()) g_detail_worker_thread.join();
 }
 
-static void start_detail_worker(std::vector<CartItem>* carts_ptr) {
+static void start_detail_worker(const std::vector<CartItem>& carts) {
     stop_detail_worker();
+    // Clear stale results from previous page
+    {
+        std::lock_guard<std::mutex> lk(g_detail_queue_mtx);
+        g_detail_queue.clear();
+    }
     g_detail_worker_active.store(true);
-    g_detail_worker_thread = std::thread(detail_worker_loop, carts_ptr);
+    // Pass by value (copy) so the thread never touches main carts vector
+    g_detail_worker_thread = std::thread(detail_worker_loop, carts);
 }
 
 // ------------------------------------------------------------------
 // Launch a non-blocking cart-list fetch
 // ------------------------------------------------------------------
 static void launch_list_fetch(CartFilter filter, const std::string& search, int page) {
-    if (g_list_fetch_active.load()) return; // already fetching
+    if (g_list_fetch_active.load()) return;
 
     g_list_fetch_active.store(true);
     g_list_fetch_done.store(false);
@@ -226,7 +239,6 @@ static void launch_list_fetch(CartFilter filter, const std::string& search, int 
 // Draw a loading spinner inside the results panel only
 // ------------------------------------------------------------------
 static void draw_loading_overlay(SDL_Renderer* renderer, TextCache& cache, TTF_Font* font, int frame) {
-    // Dim the results panel slightly
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
     draw_rect(renderer, RESULTS_X, RESULTS_Y, RESULTS_W, RESULTS_H, {0, 0, 0, 160});
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
@@ -291,14 +303,14 @@ int main(int argc, char **argv) {
     ensure_download_dir();
 
     std::vector<CartItem> carts;
-    std::unordered_map<std::string, SDL_Texture*> thumb_textures; // keyed by tid, survives page changes
+    std::unordered_map<std::string, SDL_Texture*> thumb_textures;
 
     CartFilter current_filter = CartFilter::Popular;
     std::string search_text;
     int current_page = 1;
     int selected_filter = 2;
     int selected_cart = 0;
-    int scroll_offset = 0;        // first visible cart index
+    int scroll_offset = 0;
     Focus focus = Focus::FILTERS;
     std::string status_message = "Press Y to load carts.";
     bool status_is_error = false;
@@ -312,7 +324,6 @@ int main(int argc, char **argv) {
     auto apply_fetched_list = [&](bool reset_page) {
         if (reset_page) current_page = 1;
         text_cache.clear();
-        // DON'T clear thumb_textures here — preserve cache across pages
         selected_cart = 0;
         scroll_offset = 0;
 
@@ -328,8 +339,7 @@ int main(int argc, char **argv) {
             carts = std::move(g_fetched_carts);
             status_message = std::to_string(carts.size()) + " carts found.";
             status_is_error = false;
-            // Start background detail resolution immediately
-            if (!carts.empty()) start_detail_worker(&carts);
+            if (!carts.empty()) start_detail_worker(carts);
         }
         has_loaded_once = true;
     };
@@ -337,7 +347,6 @@ int main(int argc, char **argv) {
     auto refresh_list = [&](bool reset_page) {
         if (reset_page) {
             current_page = 1;
-            // Only clear thumbnails when filter/search changes, not on page change
             for (auto& kv : thumb_textures) SDL_DestroyTexture(kv.second);
             thumb_textures.clear();
         }
@@ -347,7 +356,6 @@ int main(int argc, char **argv) {
         launch_list_fetch(current_filter, search_text, current_page);
     };
 
-    // 2. Main Render Loop
     int frame_counter = 0;
     bool running = true;
     while (appletMainLoop() && running) {
@@ -356,28 +364,38 @@ int main(int argc, char **argv) {
 
         if (kDown & HidNpadButton_Plus) running = false;
 
-        // --- Check if a background list fetch just finished ---
+        // --- Background fetch completed? ---
         if (g_list_fetch_done.load()) {
             g_list_fetch_done.store(false);
             apply_fetched_list(false);
         }
 
-        // --- Consume thumbnail bytes queue (main thread only creates SDL textures) ---
+        // --- Apply detail results from background worker (main thread only) ---
         {
-            std::lock_guard<std::mutex> lk(g_thumb_queue_mtx);
-            for (auto& pl : g_thumb_queue) {
-                if (thumb_textures.find(pl.tid) != thumb_textures.end()) continue;
-                SDL_RWops* rw = SDL_RWFromMem(pl.bytes.data(), (int)pl.bytes.size());
-                SDL_Surface* surf = IMG_Load_RW(rw, 1);
-                if (surf) {
-                    thumb_textures[pl.tid] = SDL_CreateTextureFromSurface(renderer, surf);
-                    SDL_FreeSurface(surf);
+            std::lock_guard<std::mutex> lk(g_detail_queue_mtx);
+            for (auto& res : g_detail_queue) {
+                // Find matching cart in main vector
+                for (auto& c : carts) {
+                    if (c.tid != res.tid) continue;
+                    c.author = std::move(res.author);
+                    c.download_url = std::move(res.download_url);
+                    c.thumbnail_url = std::move(res.thumbnail_url);
+                    c.detail_resolved = true;
+                    break;
+                }
+                // Create SDL texture from thumb bytes (main thread only)
+                if (!res.thumb_bytes.empty() && thumb_textures.find(res.tid) == thumb_textures.end()) {
+                    SDL_RWops* rw = SDL_RWFromMem(res.thumb_bytes.data(), (int)res.thumb_bytes.size());
+                    SDL_Surface* surf = IMG_Load_RW(rw, 1);
+                    if (surf) {
+                        thumb_textures[res.tid] = SDL_CreateTextureFromSurface(renderer, surf);
+                        SDL_FreeSurface(surf);
+                    }
                 }
             }
-            g_thumb_queue.clear();
+            g_detail_queue.clear();
         }
 
-        // --- Focus navigation ---
         bool is_loading = g_list_fetch_active.load();
 
         if (!is_loading) {
@@ -389,7 +407,6 @@ int main(int argc, char **argv) {
                 } else if (focus == Focus::RESULTS && !carts.empty()) {
                     if ((size_t)(selected_cart + 2) < carts.size()) {
                         selected_cart += 2;
-                        // Auto-scroll: keep selected in view
                         if (selected_cart >= scroll_offset + 4) scroll_offset += 2;
                     }
                 }
@@ -477,12 +494,16 @@ int main(int argc, char **argv) {
                         status_message = "Looking up download link...";
                         status_is_error = false;
                         resolve_cart_detail(item);
-                        // Try to fetch thumbnail immediately if missing
+                        // On-demand thumb fetch for immediate feedback
                         if (!item.thumbnail_url.empty() && thumb_textures.find(item.tid) == thumb_textures.end()) {
                             std::vector<unsigned char> bytes;
                             if (http_get_binary(item.thumbnail_url, bytes)) {
-                                std::lock_guard<std::mutex> lk(g_thumb_queue_mtx);
-                                g_thumb_queue.push_back({item.tid, std::move(bytes)});
+                                SDL_RWops* rw = SDL_RWFromMem(bytes.data(), (int)bytes.size());
+                                SDL_Surface* surf = IMG_Load_RW(rw, 1);
+                                if (surf) {
+                                    thumb_textures[item.tid] = SDL_CreateTextureFromSurface(renderer, surf);
+                                    SDL_FreeSurface(surf);
+                                }
                             }
                         }
                     }
@@ -511,7 +532,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // --- Pick up a finished download ---
+        // --- Pick up finished download ---
         if (!g_download_active.load() && g_downloading_index >= 0) {
             if ((size_t)g_downloading_index < carts.size()) {
                 carts[g_downloading_index].downloading = false;
@@ -522,7 +543,7 @@ int main(int argc, char **argv) {
             if (g_download_thread.joinable()) g_download_thread.join();
         }
 
-        // --- Debug line for selected cart ---
+        // --- Debug line ---
         if (focus == Focus::RESULTS && !carts.empty() && (size_t)selected_cart < carts.size()) {
             CartItem& sel = carts[selected_cart];
             if (sel.detail_resolved) {
@@ -532,15 +553,14 @@ int main(int argc, char **argv) {
         }
 
         // ================================================================
-        // RENDERING
+        // RENDER
         // ================================================================
         SDL_SetRenderDrawColor(renderer, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, 255);
         SDL_RenderClear(renderer);
 
-        // Font diagnostic strip
         draw_rect(renderer, 0, 0, SCREEN_WIDTH, 6, fonts_ok ? SDL_Color{0,200,0,255} : SDL_Color{220,0,0,255});
 
-        // --- TOP HEADER BAR ---
+        // Header
         draw_rect(renderer, 0, 0, SCREEN_WIDTH, 45, COLOR_PANEL);
         draw_rect(renderer, 0, 44, SCREEN_WIDTH, 1, COLOR_BORDER);
         draw_text(renderer, text_cache, font_header, "PICO-8 Cart Browser & Downloader v1.1", 20, 8, COLOR_WHITE);
@@ -551,12 +571,11 @@ int main(int argc, char **argv) {
             draw_text(renderer, text_cache, font_body, credit, SCREEN_WIDTH - cw - 20, 13, COLOR_MUTED);
         }
 
-        // --- LEFT SIDEBAR (always interactive, never blocked by loading) ---
+        // Sidebar
         draw_rect(renderer, SIDEBAR_X, 60, SIDEBAR_W, 610, COLOR_PANEL);
         draw_rect(renderer, SIDEBAR_X, 60, SIDEBAR_W, 610, COLOR_BORDER, false);
         draw_text(renderer, text_cache, font_bold, "Filters & Search", 35, 75, COLOR_WHITE);
 
-        // Search box
         {
             SDL_Color box_color = (focus == Focus::SEARCH) ? COLOR_SELECTED : COLOR_BG;
             draw_rect(renderer, 35, 105, 330, 45, box_color);
@@ -566,7 +585,6 @@ int main(int argc, char **argv) {
             draw_text(renderer, text_cache, font_body, shown, 48, 118, txt_color, 300);
         }
 
-        // Filter Options
         for (int i = 0; i < 4; i++) {
             bool is_current = (filters_value[i] == current_filter);
             bool is_focused = (focus == Focus::FILTERS && selected_filter == i);
@@ -578,7 +596,6 @@ int main(int argc, char **argv) {
             draw_text(renderer, text_cache, font_bold, filters_label[i], 50, by + 12, COLOR_WHITE);
         }
 
-        // Download Path
         {
             SDL_Color box_color = (focus == Focus::PATH) ? COLOR_SELECTED : COLOR_BG;
             draw_rect(renderer, 35, 460, 330, 45, box_color);
@@ -587,7 +604,6 @@ int main(int argc, char **argv) {
             draw_text(renderer, text_cache, font_body, g_config.download_path, 48, 473, COLOR_WHITE, 300);
         }
 
-        // Status
         {
             SDL_Color msg_color = status_is_error ? COLOR_ERROR : COLOR_MUTED;
             draw_text(renderer, text_cache, font_small, status_message, 35, 560, msg_color, 320);
@@ -600,7 +616,7 @@ int main(int argc, char **argv) {
             draw_text(renderer, text_cache, font_small, debug_line, 35, 625, COLOR_MUTED, 320);
         }
 
-        // --- RIGHT GRID AREA ---
+        // Results panel
         draw_rect(renderer, RESULTS_X, RESULTS_Y, RESULTS_W, RESULTS_H, COLOR_PANEL);
         draw_rect(renderer, RESULTS_X, RESULTS_Y, RESULTS_W, RESULTS_H, COLOR_BORDER, false);
 
@@ -620,7 +636,6 @@ int main(int argc, char **argv) {
                           440, 300, COLOR_MUTED);
             }
 
-            // Render visible grid items (2 columns, scrollable)
             for (size_t i = scroll_offset; i < carts.size() && i < (size_t)(scroll_offset + 4); i++) {
                 size_t vis_idx = i - scroll_offset;
                 int col = vis_idx % 2;
@@ -631,11 +646,9 @@ int main(int argc, char **argv) {
                 bool is_selected = (focus == Focus::RESULTS && (int)i == selected_cart);
                 SDL_Color card_border = is_selected ? COLOR_ACCENT : COLOR_BORDER;
 
-                // Card Base
                 draw_rect(renderer, card_x, card_y, 400, 220, COLOR_BG);
                 draw_rect(renderer, card_x, card_y, 400, 220, card_border, false);
 
-                // Thumbnail
                 draw_rect(renderer, card_x + 10, card_y + 10, 160, 160, COLOR_PANEL);
                 draw_rect(renderer, card_x + 10, card_y + 10, 160, 160, COLOR_BORDER, false);
                 auto thumb_it = thumb_textures.find(carts[i].tid);
@@ -646,12 +659,10 @@ int main(int argc, char **argv) {
                     draw_text(renderer, text_cache, font_small, "PICO-8", card_x + 55, card_y + 80, COLOR_MUTED);
                 }
 
-                // Title / author
                 draw_text(renderer, text_cache, font_bold, carts[i].title, card_x + 180, card_y + 12, COLOR_WHITE, 210);
                 std::string author_line = "by " + (carts[i].author.empty() ? std::string("?") : carts[i].author);
                 draw_text(renderer, text_cache, font_small, author_line, card_x + 180, card_y + 40, COLOR_MUTED, 210);
 
-                // Download progress or button
                 if (carts[i].downloading) {
                     float pct = g_download_progress.load();
                     draw_rect(renderer, card_x + 180, card_y + 130, 210, 40, COLOR_BG);
@@ -667,7 +678,6 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Scroll indicators
             if (scroll_offset > 0) {
                 draw_text(renderer, text_cache, font_small, "\x18 more above", RESULTS_X + RESULTS_W - 100, RESULTS_Y + 10, COLOR_MUTED);
             }
@@ -676,7 +686,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // --- BOTTOM FOOTER ---
+        // Footer
         draw_rect(renderer, 0, 680, SCREEN_WIDTH, 40, COLOR_PANEL);
         draw_rect(renderer, 0, 680, SCREEN_WIDTH, 1, COLOR_BORDER);
         draw_text(renderer, text_cache, font_small,
