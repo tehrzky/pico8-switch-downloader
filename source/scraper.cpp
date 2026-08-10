@@ -1,6 +1,5 @@
 #include "scraper.hpp"
 #include <curl/curl.h>
-#include <regex>
 #include <cctype>
 #include <cstdio>
 #include <fstream>
@@ -145,31 +144,40 @@ bool fetch_cart_list(CartFilter filter,
         return false;
     }
 
-    // Cards look like:
-    //   <a href="?tid=150672">
-    //       <div ...><div ...>Crimson Night</div></div>
-    //   </a>
-    // Title text is nested two <div>s inside the link, not inline.
-    static const std::regex item_re(R"RX(<a\s+href="\?tid=(\d+)">\s*<div[^>]*>\s*<div[^>]*>([^<]+)</div>)RX");
-    auto begin = std::sregex_iterator(html.begin(), html.end(), item_re);
-    auto end = std::sregex_iterator();
+    // Manual parsing: find all <a href="?tid=..."> ... <div>...<div>Title</div></div>
+    size_t pos = 0;
+    while ((pos = html.find("<a href=\"?tid=", pos)) != std::string::npos) {
+        size_t tid_start = pos + 14; // after "?tid="
+        size_t tid_end = html.find('"', tid_start);
+        if (tid_end == std::string::npos) break;
+        std::string tid = html.substr(tid_start, tid_end - tid_start);
 
-    for (auto it = begin; it != end; ++it) {
-        std::string tid = (*it)[1].str();
+        // Find the first <div> after this, then the nested <div> with title
+        size_t div1 = html.find("<div", tid_end);
+        if (div1 == std::string::npos) break;
+        size_t div2 = html.find("<div", div1 + 1);
+        if (div2 == std::string::npos) break;
+        size_t title_start = html.find('>', div2) + 1;
+        size_t title_end = html.find("</div>", title_start);
+        if (title_end == std::string::npos) break;
+        std::string title = html.substr(title_start, title_end - title_start);
+
+        // Avoid duplicates
         bool dup = false;
         for (auto& existing : out_items) if (existing.tid == tid) { dup = true; break; }
-        if (dup) continue;
-
-        CartItem item;
-        item.tid = tid;
-        item.title = decode_entities((*it)[2].str());
-        item.thread_url = "https://www.lexaloffle.com/bbs/?tid=" + tid + "&cat=7";
-        out_items.push_back(item);
+        if (!dup) {
+            CartItem item;
+            item.tid = tid;
+            item.title = decode_entities(title);
+            item.thread_url = "https://www.lexaloffle.com/bbs/?tid=" + tid + "&cat=7";
+            out_items.push_back(item);
+        }
+        pos = tid_end;
     }
 
     if (out_items.empty()) {
-        size_t tid_count = 0, pos = 0;
-        while ((pos = html.find("tid=", pos)) != std::string::npos) { tid_count++; pos += 4; }
+        size_t tid_count = 0, p = 0;
+        while ((p = html.find("tid=", p)) != std::string::npos) { tid_count++; p += 4; }
         out_error = "Parsed 0 carts from a " + std::to_string(html.size()) +
                     "-byte response (found \"tid=\" " + std::to_string(tid_count) +
                     " times) - check sdmc:/switch/pico8-downloader/debug_last_fetch.txt";
@@ -186,35 +194,90 @@ void resolve_cart_detail(CartItem& item) {
     std::string curl_err;
     if (!http_get_text(item.thread_url, html, http_code, curl_err)) return;
 
-    static const std::regex author_re(R"(<a[^>]+href=["'][^"']*[?&]uid=\d+["'][^>]*>([^<]+)</a>)");
-    std::smatch m;
-    if (std::regex_search(html, m, author_re)) {
-        item.author = decode_entities(m[1].str());
+    // --- Extract author ---
+    size_t pos = html.find("?uid=");
+    if (pos != std::string::npos) {
+        size_t start = html.rfind('>', pos);
+        if (start != std::string::npos) {
+            start = html.find('>', start) + 1;
+            size_t end = html.find("</a>", start);
+            if (end != std::string::npos) {
+                item.author = decode_entities(html.substr(start, end - start));
+            }
+        }
     }
 
-    static const std::regex cart_re1(R"(<a[^>]+href=["']([^"']+\.p8\.png)["'][^>]*title=["']Open Cartridge File["'])");
-    static const std::regex cart_re2(R"(<a[^>]+title=["']Open Cartridge File["'][^>]*href=["']([^"']+\.p8\.png)["'])");
-    static const std::regex cart_re_fallback(R"(["']([^"'\s>]+\.p8\.png)["'])");
-    if (std::regex_search(html, m, cart_re1) || std::regex_search(html, m, cart_re2) ||
-        std::regex_search(html, m, cart_re_fallback)) {
-        item.download_url = absolute_url(m[1].str());
+    // --- Extract download URL (.p8.png) ---
+    const char* markers[] = { "title=\"Open Cartridge File\"", "title='Open Cartridge File'" };
+    for (const char* marker : markers) {
+        pos = html.find(marker);
+        if (pos != std::string::npos) {
+            size_t href_pos = html.rfind("href=\"", pos);
+            if (href_pos == std::string::npos) href_pos = html.rfind("href='", pos);
+            if (href_pos != std::string::npos) {
+                size_t start = href_pos + 6;
+                size_t end = html.find('"', start);
+                if (end == std::string::npos) end = html.find('\'', start);
+                if (end != std::string::npos) {
+                    std::string url = html.substr(start, end - start);
+                    if (url.find(".p8.png") != std::string::npos) {
+                        item.download_url = absolute_url(url);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: find any .p8.png link
+    if (item.download_url.empty()) {
+        pos = html.find(".p8.png");
+        if (pos != std::string::npos) {
+            size_t href_pos = html.rfind("href=\"", pos);
+            if (href_pos != std::string::npos) {
+                size_t start = href_pos + 6;
+                size_t end = html.find('"', start);
+                if (end != std::string::npos && end > pos) {
+                    item.download_url = absolute_url(html.substr(start, end - start));
+                }
+            }
+        }
     }
 
-    static const std::regex thumb_re(R"(<img[^>]+src=["']([^"']*\/bbs\/thumbs\/[^"']+\.(?:png|gif))["'])");
-    if (std::regex_search(html, m, thumb_re)) {
-        item.thumbnail_url = absolute_url(m[1].str());
-    } else {
-        std::string head = html.substr(0, std::min<size_t>(html.size(), 6000));
-        static const std::regex loose_img_re(R"(<img[^>]+src=["']([^"']+\.(?:png|gif))["'])");
-        auto begin = std::sregex_iterator(head.begin(), head.end(), loose_img_re);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string candidate = (*it)[1].str();
-            if (candidate.find("/gfx/") != std::string::npos) continue;
-            if (candidate.find("/icons/") != std::string::npos) continue;
-            if (candidate.find("avatar") != std::string::npos) continue;
-            item.thumbnail_url = absolute_url(candidate);
-            break;
+    // --- Extract thumbnail ---
+    // Priority: /bbs/thumbs/
+    pos = html.find("/bbs/thumbs/");
+    if (pos != std::string::npos) {
+        size_t src_pos = html.rfind("src=\"", pos);
+        if (src_pos == std::string::npos) src_pos = html.rfind("src='", pos);
+        if (src_pos != std::string::npos) {
+            size_t start = src_pos + 5;
+            size_t end = html.find('"', start);
+            if (end == std::string::npos) end = html.find('\'', start);
+            if (end != std::string::npos) {
+                item.thumbnail_url = absolute_url(html.substr(start, end - start));
+            }
+        }
+    }
+    // Fallback: any image that is not gfx/icons/avatar
+    if (item.thumbnail_url.empty()) {
+        pos = html.find("<img");
+        while (pos != std::string::npos) {
+            size_t src_pos = html.find("src=", pos);
+            if (src_pos == std::string::npos) break;
+            size_t start = src_pos + 5;
+            size_t end = html.find('"', start);
+            if (end == std::string::npos) end = html.find('\'', start);
+            if (end != std::string::npos) {
+                std::string src = html.substr(start, end - start);
+                if (src.find("/gfx/") == std::string::npos &&
+                    src.find("/icons/") == std::string::npos &&
+                    src.find("avatar") == std::string::npos &&
+                    (src.find(".png") != std::string::npos || src.find(".gif") != std::string::npos)) {
+                    item.thumbnail_url = absolute_url(src);
+                    break;
+                }
+            }
+            pos = html.find("<img", pos + 4);
         }
     }
 }
