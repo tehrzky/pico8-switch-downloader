@@ -63,7 +63,7 @@ struct DetailResult {
     std::string author;
     std::string download_url;
     std::string thumbnail_url;
-    std::vector<unsigned char> thumb_bytes;   // <-- re-added
+    std::vector<unsigned char> thumb_bytes;
 };
 static std::atomic<bool>  g_detail_worker_active{false};
 static std::thread        g_detail_worker_thread;
