@@ -3,8 +3,17 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <algorithm> // for trim
 
 namespace {
+
+// trim leading/trailing whitespace
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\n\r");
+    return s.substr(start, end - start + 1);
+}
 
 size_t string_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -65,13 +74,14 @@ std::string decode_entities(const std::string& in) {
     return out;
 }
 
+// URL encode with %20 for spaces (standard for query strings)
 std::string url_encode(const std::string& in) {
     std::string out;
     for (unsigned char c : in) {
         if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
             out += (char)c;
         } else if (c == ' ') {
-            out += '+';
+            out += "%20";  // use %20 instead of '+'
         } else {
             char buf[4];
             snprintf(buf, sizeof(buf), "%%%02X", c);
@@ -126,10 +136,11 @@ bool fetch_cart_list(CartFilter filter,
     out_items.clear();
     out_error.clear();
 
+    std::string search_trimmed = trim(search); // remove extra spaces
     std::string url = "https://www.lexaloffle.com/bbs/?cat=7&sub=2&mode=carts&page=" +
                        std::to_string(page) + "&" + filter_query(filter);
-    if (!search.empty()) {
-        url += "&keywords=" + url_encode(search);
+    if (!search_trimmed.empty()) {
+        url += "&keywords=" + url_encode(search_trimmed);
     }
 
     std::string html;
@@ -243,19 +254,17 @@ void resolve_cart_detail(CartItem& item) {
     }
 
     // --- Extract thumbnail (improved) ---
-    // First, try to find any <img> tag with src containing "/bbs/thumbs/"
     pos = 0;
     while ((pos = html.find("<img", pos)) != std::string::npos) {
         size_t src_pos = html.find("src=", pos);
         if (src_pos == std::string::npos) break;
         
-        size_t start = src_pos + 5; // after "src="
+        size_t start = src_pos + 5;
         size_t end = html.find('"', start);
         if (end == std::string::npos) end = html.find('\'', start);
         if (end == std::string::npos) { pos++; continue; }
         
         std::string src = html.substr(start, end - start);
-        // Check if this looks like a thumbnail
         if (src.find("/bbs/thumbs/") != std::string::npos) {
             item.thumbnail_url = absolute_url(src);
             break;
@@ -263,7 +272,6 @@ void resolve_cart_detail(CartItem& item) {
         pos = end;
     }
 
-    // Fallback: any image that is not gfx/icons/avatar
     if (item.thumbnail_url.empty()) {
         pos = 0;
         while ((pos = html.find("<img", pos)) != std::string::npos) {
