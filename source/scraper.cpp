@@ -228,7 +228,6 @@ void resolve_cart_detail(CartItem& item) {
             }
         }
     }
-    // Fallback: find any .p8.png link
     if (item.download_url.empty()) {
         pos = html.find(".p8.png");
         if (pos != std::string::npos) {
@@ -243,41 +242,48 @@ void resolve_cart_detail(CartItem& item) {
         }
     }
 
-    // --- Extract thumbnail ---
-    // Priority: /bbs/thumbs/
-    pos = html.find("/bbs/thumbs/");
-    if (pos != std::string::npos) {
-        size_t src_pos = html.rfind("src=\"", pos);
-        if (src_pos == std::string::npos) src_pos = html.rfind("src='", pos);
-        if (src_pos != std::string::npos) {
-            size_t start = src_pos + 5;
-            size_t end = html.find('"', start);
-            if (end == std::string::npos) end = html.find('\'', start);
-            if (end != std::string::npos) {
-                item.thumbnail_url = absolute_url(html.substr(start, end - start));
-            }
+    // --- Extract thumbnail (improved) ---
+    // First, try to find any <img> tag with src containing "/bbs/thumbs/"
+    pos = 0;
+    while ((pos = html.find("<img", pos)) != std::string::npos) {
+        size_t src_pos = html.find("src=", pos);
+        if (src_pos == std::string::npos) break;
+        
+        size_t start = src_pos + 5; // after "src="
+        size_t end = html.find('"', start);
+        if (end == std::string::npos) end = html.find('\'', start);
+        if (end == std::string::npos) { pos++; continue; }
+        
+        std::string src = html.substr(start, end - start);
+        // Check if this looks like a thumbnail
+        if (src.find("/bbs/thumbs/") != std::string::npos) {
+            item.thumbnail_url = absolute_url(src);
+            break;
         }
+        pos = end;
     }
+
     // Fallback: any image that is not gfx/icons/avatar
     if (item.thumbnail_url.empty()) {
-        pos = html.find("<img");
-        while (pos != std::string::npos) {
+        pos = 0;
+        while ((pos = html.find("<img", pos)) != std::string::npos) {
             size_t src_pos = html.find("src=", pos);
             if (src_pos == std::string::npos) break;
+            
             size_t start = src_pos + 5;
             size_t end = html.find('"', start);
             if (end == std::string::npos) end = html.find('\'', start);
-            if (end != std::string::npos) {
-                std::string src = html.substr(start, end - start);
-                if (src.find("/gfx/") == std::string::npos &&
-                    src.find("/icons/") == std::string::npos &&
-                    src.find("avatar") == std::string::npos &&
-                    (src.find(".png") != std::string::npos || src.find(".gif") != std::string::npos)) {
-                    item.thumbnail_url = absolute_url(src);
-                    break;
-                }
+            if (end == std::string::npos) { pos++; continue; }
+            
+            std::string src = html.substr(start, end - start);
+            if (src.find("/gfx/") == std::string::npos &&
+                src.find("/icons/") == std::string::npos &&
+                src.find("avatar") == std::string::npos &&
+                (src.find(".png") != std::string::npos || src.find(".gif") != std::string::npos)) {
+                item.thumbnail_url = absolute_url(src);
+                break;
             }
-            pos = html.find("<img", pos + 4);
+            pos = end;
         }
     }
 }
