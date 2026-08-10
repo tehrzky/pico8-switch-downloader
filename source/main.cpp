@@ -58,14 +58,12 @@ static std::string        g_fetch_error;
 static bool               g_fetch_error_flag = false;
 
 // --- Background detail worker result queue ---
-// The worker never touches the main carts vector. It works on a copy
-// and pushes results here. Main thread applies them safely.
 struct DetailResult {
     std::string tid;
     std::string author;
     std::string download_url;
     std::string thumbnail_url;
-    // thumb_bytes removed – thumbnails are fetched on‑demand in main thread
+    std::vector<unsigned char> thumb_bytes;   // <-- re-added
 };
 static std::atomic<bool>  g_detail_worker_active{false};
 static std::thread        g_detail_worker_thread;
@@ -164,8 +162,8 @@ static std::string prompt_keyboard(const std::string& guide, const std::string& 
 }
 
 // ------------------------------------------------------------------
-// Background worker: resolves details on a COPY, pushes to queue
-// (does NOT fetch thumbnails – that's done on‑demand in main thread)
+// Background worker: resolves details + fetches thumbnails
+// (all safe – no regex)
 // ------------------------------------------------------------------
 static void detail_worker_loop(std::vector<CartItem> carts_copy) {
     for (auto& c : carts_copy) {
@@ -180,6 +178,11 @@ static void detail_worker_loop(std::vector<CartItem> carts_copy) {
         res.download_url = c.download_url;
         res.thumbnail_url = c.thumbnail_url;
 
+        // Fetch thumbnail bytes if URL exists
+        if (!c.thumbnail_url.empty()) {
+            http_get_binary(c.thumbnail_url, res.thumb_bytes);
+        }
+
         std::lock_guard<std::mutex> lk(g_detail_queue_mtx);
         g_detail_queue.push_back(std::move(res));
     }
@@ -193,13 +196,11 @@ static void stop_detail_worker() {
 
 static void start_detail_worker(const std::vector<CartItem>& carts) {
     stop_detail_worker();
-    // Clear stale results from previous page
     {
         std::lock_guard<std::mutex> lk(g_detail_queue_mtx);
         g_detail_queue.clear();
     }
     g_detail_worker_active.store(true);
-    // Pass by value (copy) so the thread never touches main carts vector
     g_detail_worker_thread = std::thread(detail_worker_loop, carts);
 }
 
@@ -380,7 +381,15 @@ int main(int argc, char **argv) {
                     c.detail_resolved = true;
                     break;
                 }
-                // No thumbnail texture created here – we fetch on‑demand when user selects the cart
+                // Create SDL texture from thumb bytes (main thread only)
+                if (!res.thumb_bytes.empty() && thumb_textures.find(res.tid) == thumb_textures.end()) {
+                    SDL_RWops* rw = SDL_RWFromMem(res.thumb_bytes.data(), (int)res.thumb_bytes.size());
+                    SDL_Surface* surf = IMG_Load_RW(rw, 1);
+                    if (surf) {
+                        thumb_textures[res.tid] = SDL_CreateTextureFromSurface(renderer, surf);
+                        SDL_FreeSurface(surf);
+                    }
+                }
             }
             g_detail_queue.clear();
         }
@@ -483,7 +492,7 @@ int main(int argc, char **argv) {
                         status_message = "Looking up download link...";
                         status_is_error = false;
                         resolve_cart_detail(item);
-                        // On-demand thumb fetch for immediate feedback
+                        // On-demand thumb fetch for immediate feedback (if not already fetched)
                         if (!item.thumbnail_url.empty() && thumb_textures.find(item.tid) == thumb_textures.end()) {
                             std::vector<unsigned char> bytes;
                             if (http_get_binary(item.thumbnail_url, bytes)) {
